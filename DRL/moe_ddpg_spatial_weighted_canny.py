@@ -269,6 +269,69 @@ class MultiHeadActor(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TEMPORAL CRITIC  (FIX: Explicit T_norm concatenation before final FC)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TemporalCritic(nn.Module):
+    """
+    Wrapper around ResNet_wobn that concatenates T_norm as an explicit
+    feature before the final FC layer.
+
+    Problem with original: T was passed as a constant spatial channel.
+    After convolutions, this becomes a single number lost in 8192 features.
+    The critic cannot learn that "step 20 + quality 0.8" is different from
+    "step 5 + quality 0.8".
+
+    Fix: Extract conv features, flatten, concat T_norm, then FC.
+    This forces the critic to use T_norm as a real input feature.
+    """
+
+    def __init__(self, num_inputs: int, depth: int, num_outputs: int):
+        super().__init__()
+        # Base ResNet without final FC
+        self.backbone = ResNet_wobn(num_inputs, depth, num_outputs)
+        
+        # Replace final FC with one that accepts feat_dim + 1 (for T_norm)
+        feat_dim = 512  # ResNet-18 output dimension
+        self.backbone.fc = nn.Identity()  # Remove original FC
+        
+        self.temporal_fc = nn.Linear(feat_dim + 1, num_outputs)
+
+    def forward(self, x: torch.Tensor, T_norm: torch.Tensor = None) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x      : (B, num_inputs, 128, 128)  — merged state [canvas0, canvas1, gt, T, coord]
+        T_norm : (B, 1)                      — normalised step progress [0,1]
+
+        Returns
+        -------
+        Q      : (B, 1)                      — state-action value
+        """
+        # Extract spatial features through backbone conv layers
+        feat = self.backbone.relu_1(self.backbone.conv1(x))
+        feat = self.backbone.layer1(feat)
+        feat = self.backbone.layer2(feat)
+        feat = self.backbone.layer3(feat)
+        feat = self.backbone.layer4(feat)
+        feat = F.avg_pool2d(feat, 4)
+        feat = feat.view(feat.size(0), -1)  # (B, feat_dim)
+
+        # If T_norm not provided, extract from x (backward compatibility)
+        if T_norm is None:
+            # x contains T as channel 9 (after canvas0, canvas1, gt)
+            # T channel is constant, so sample from corner
+            T_norm = x[:, 9:10, 0, 0]  # (B, 1)
+
+        # Concatenate T_norm as explicit feature
+        feat_temporal = torch.cat([feat, T_norm], dim=1)  # (B, feat_dim + 1)
+
+        # Final Q-value
+        Q = self.temporal_fc(feat_temporal)
+        return Q
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  4. Spatial Progress Bonus (patch-level intrinsic reward)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -329,6 +392,77 @@ class SpatialProgressBonus:
                 / (ini_dis.to(improvement.device) + 1e-8)
         return bonus.cpu().numpy()
 
+
+class OUNoise:
+    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.2):
+        self.action_dim = action_dim
+        self.mu    = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.state = np.ones(action_dim) * self.mu
+
+    def reset(self):
+        self.state = np.ones(self.action_dim) * self.mu
+
+    def noise(self):
+        x  = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(self.action_dim)
+        self.state = x + dx
+        return self.state
+
+class PaintNoise:
+    """Structured noise for painting with parameter-specific scales"""
+    
+    # Noise scales per parameter group
+    SCALES = {
+        'position': 0.05,   # x0,y0,x2,y2
+        'control':  0.08,   # x1,y1  
+        'width':    0.02,   # w0,w1,w2
+        'color':    0.08,   # r,g,b
+        'opacity':  0.03,   # alpha
+    }
+    
+    # Parameter indices in 13-dim stroke
+    INDICES = {
+        'position': [0, 1, 4, 5],
+        'control':  [2, 3],
+        'width':    [6, 7, 8],
+        'color':    [9, 10, 11],
+        'opacity':  [12],
+    }
+    
+    def __init__(self, num_strokes=5):
+        self.num_strokes = num_strokes
+        self.action_dim = num_strokes * 13
+        self.ou = OUNoise(self.action_dim)
+        
+    def reset(self):
+        self.ou.reset()
+        
+    def noise(self, action, phase=0.5, noise_factor=1.0):
+        """
+        phase: 0=early, 1=late — controls noise magnitude
+        """
+        # Phase-dependent base scale: early=more noise, late=less
+        phase_scale = 1.0 - 0.8 * phase  # 1.0 at start, 0.2 at end
+        
+        # Generate structured noise
+        noise = np.zeros_like(action)
+        for group, scale in self.SCALES.items():
+            indices = self.INDICES[group]
+            for stroke_idx in range(self.num_strokes):
+                stroke_offset = stroke_idx * 13
+                for idx in indices:
+                    noise[:, stroke_offset + idx] = np.random.normal(
+                        0, scale * phase_scale * noise_factor, 
+                        size=action.shape[0]
+                    )
+        
+        # Add temporal correlation via OU process
+        ou_noise = self.ou.noise() * noise_factor * 0.3  # 30% OU, 70% independent
+        noise += ou_noise
+        
+        return np.clip(action + noise, 0, 1)
 # ══════════════════════════════════════════════════════════════════════════════
 #  Phase-Conditioned DDPG   (drop-in replacement for DDPG in ddpg.py)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -383,9 +517,9 @@ class MoEDDPG:
         self.actor        = MultiHeadActor(9, 18, self.action_dim, num_experts, sigma)
         self.actor_target = MultiHeadActor(9, 18, self.action_dim, num_experts, sigma)
 
-        # ── Shared critic + target (identical to baseline) ────────────────────
-        self.critic        = ResNet_wobn(3 + 9, 18, 1)
-        self.critic_target = ResNet_wobn(3 + 9, 18, 1)
+        # ── Temporal Critic + target (FIXED: explicit T_norm feature) ─────────
+        self.critic        = TemporalCritic(3 + 9, 18, 1)
+        self.critic_target = TemporalCritic(3 + 9, 18, 1)
 
 
         # ── Optimisers ────────────────────────────────────────────────────────
@@ -398,6 +532,7 @@ class MoEDDPG:
 
         if resume is not None:
             self.load_weights(resume)
+            #self.noise_generator.reset()
 
         # ── Replay buffer ─────────────────────────────────────────────────────
         self.memory = rpm(rmsize * max_step)
@@ -406,6 +541,7 @@ class MoEDDPG:
         self.state       = [None] * env_batch
         self.action      = [None] * env_batch
         self.noise_level = np.zeros(env_batch)
+        self.noise_generator = PaintNoise(num_strokes=num_strokes)
 
         self._move_to_device()
 
@@ -511,43 +647,26 @@ class MoEDDPG:
 
         return np.clip(action, 0, 1)
     
-    # def select_action(self, state, noise_factor=0, return_fix=False, target_theta=None):
-    #     """
-    #     Selects an action and applies guided noise if noise_factor > 0.
-    #     target_theta: orientation hint passed from env.step()
-    #     """
-    #     self._set_mode(train=False)
-    #     with torch.no_grad():
-    #         action = to_numpy(self.play(state))
-        
-    #     if noise_factor > 0:
-    #         # Use the new structured noise method
-    #         action = self.noise_action(action, target_theta=target_theta, noise_factor=noise_factor)
-            
-    #     self._set_mode(train=True)
-    #     self.action = action
-    #     return self.action
     
-    def select_action(self, state, noise_factor=0, return_fix=False, target_theta=None, explore_prob=0.0):
-        """
-        explore_prob: The probability (0.0 to 1.0) of applying noise.
-        """
+    def select_action(self, state, noise_factor=0, target_theta=None, training=False):
+        """Always explore during training, with structured noise"""
         self._set_mode(train=False)
         with torch.no_grad():
             action = to_numpy(self.play(state))
         
-        # Only explore if we are above a random threshold
-        if noise_factor > 0 and np.random.uniform(0, 1) < explore_prob:
-            # Apply the structured Von Mises noise
-            action = self.noise_action(action, target_theta=target_theta, noise_factor=noise_factor)
-            
+        if noise_factor > 0 and training:
+            # Extract phase from state
+            T_norm = state[:, 6:7, 0, 0].float() / self.max_step if hasattr(state, 'shape') else 0.5
+            action = self.noise_generator.noise(action, phase=T_norm, noise_factor=noise_factor)
+        
         self._set_mode(train=True)
         self.action = action
-        return self.action
+        return action
 
     def reset(self, obs, factor):
         self.state       = obs
         self.noise_level = np.random.uniform(0, factor, self.env_batch)
+        self.noise_generator.reset()
 
     def observe(self, reward, state, done, step):
         s0 = torch.tensor(self.state, device='cpu')
@@ -586,7 +705,10 @@ class MoEDDPG:
             coord_,
         ], dim=1)
 
-        Q = (self.critic_target if target else self.critic)(merged)
+        # ── FIX: Pass T_norm explicitly to TemporalCritic ─────────────────────
+        T_norm = T / self.max_step  # (B, 1) normalised progress
+        critic_net = self.critic_target if target else self.critic
+        Q = critic_net(merged, T_norm)
 
         if not target and self.log % 20 == 0 and self.writer:
             self.writer.add_scalar('train_moe/expect_reward', Q.mean(),         self.log)
@@ -626,73 +748,44 @@ class MoEDDPG:
         value_loss.backward()
         self.critic_optim.step()
 
-        # ── Actor: policy gradient through Q + GAN with PCGrad ────────────
-        # Direct call to preserve gradients for the ResNet backbone
+        # Actor update
         norm_img, T_norm = self._norm_obs(state)
         action_pred = self.actor(norm_img, T_norm)
-        
-        # Get separate signals from evaluate: (full, q_only, gan_only)
         _, q_val, gan_reward = self._evaluate(state.detach(), action_pred)
+        
+        # Phase-based dynamic weighting
+        progress = step / max(train_times, 1)
+        
+        if progress < 0.3:
+            # Early: GAN dominates (learn to paint realistically)
+            w_gan, w_q = 0.9, 0.1
+        elif progress < 0.7:
+            # Mid: balanced
+            w_gan, w_q = 0.6, 0.4
+        else:
+            # Late: Q dominates (refine accuracy)
+            w_gan, w_q = 0.3, 0.7
+        
+        self.actor_optim.zero_grad()
+        loss = w_gan * (-gan_reward.mean()) + w_q * (-q_val.mean())
+        loss.backward()
+        self.actor_optim.step()
 
-        if step < int(train_times * 0.4):  # Warm-up phase
-            # During warm-up, only use the GAN reward
-            self.actor_optim.zero_grad()
-            loss_gan = -gan_reward.mean()
-            loss_gan.backward()
-            self.actor_optim.step()
+        # ── Target Sync & Logging ─────────────────────────────────────────
+        soft_update(self.actor_target, self.actor, self.tau)
+        soft_update(self.critic_target, self.critic, self.tau)
 
-            # ── Target Sync 
-            soft_update(self.actor_target, self.actor, self.tau)
-            soft_update(self.critic_target, self.critic, self.tau)
+        if self.log % 20 == 0 and self.writer:
+            self.writer.add_scalar('train_moe/policy_loss', loss.item(), self.log)
+            self.writer.add_scalar('train_moe/value_loss',  value_loss.item(),  self.log)
+            for k, head in enumerate(self.actor.heads):
+                grad_norm = sum(
+                    p.grad.norm().item() ** 2
+                    for p in head.parameters() if p.grad is not None
+                ) ** 0.5
+                self.writer.add_scalar(f'train_moe/head{k}_grad_norm', grad_norm, self.log)
 
-            return q_val.mean(), value_loss
-        else: 
-            # PCGrad Step 1: Realism Gradient (Master Signal)
-            self.actor_optim.zero_grad()
-            loss_gan = -gan_reward.mean()
-            loss_gan.backward(retain_graph=True)
-            
-            # Clone the GAN gradients (The Master)
-            grads_master = [p.grad.clone() if p.grad is not None else None for p in self.actor.parameters()]
-
-            # PCGrad Step 2: Accuracy Gradient (Follower Signal)
-            self.actor_optim.zero_grad()
-            loss_q = -q_val.mean()
-            loss_q.backward()
-
-            # PCGrad Step 3: Gradient Surgery (Projection)
-            for i, p in enumerate(self.actor.parameters()):
-                if grads_master[i] is None or p.grad is None:
-                    continue
-                
-                g_acc = p.grad           # Follower
-                g_gan = grads_master[i]  # Master
-                
-                # Conflict Check: If directions are opposing, project Accuracy onto the normal plane of GAN
-                dot_prod = torch.sum(g_acc * g_gan)
-                if dot_prod < 0:
-                    p.grad = g_acc - (dot_prod / (torch.norm(g_gan)**2 + 1e-8)) * g_gan
-                
-                # Combine signals: Final gradient = Master + Non-conflicting Follower
-                p.grad += g_gan
-
-            self.actor_optim.step()
-
-            # ── Target Sync & Logging ─────────────────────────────────────────
-            soft_update(self.actor_target, self.actor, self.tau)
-            soft_update(self.critic_target, self.critic, self.tau)
-
-            if self.log % 20 == 0 and self.writer:
-                self.writer.add_scalar('train_moe/policy_loss', loss_q.item(), self.log)
-                self.writer.add_scalar('train_moe/value_loss',  value_loss.item(),  self.log)
-                for k, head in enumerate(self.actor.heads):
-                    grad_norm = sum(
-                        p.grad.norm().item() ** 2
-                        for p in head.parameters() if p.grad is not None
-                    ) ** 0.5
-                    self.writer.add_scalar(f'train_moe/head{k}_grad_norm', grad_norm, self.log)
-
-            return q_val.mean(), value_loss
+        return q_val.mean(), value_loss
 
     # ── Mode helpers ──────────────────────────────────────────────────────────
 

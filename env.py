@@ -251,18 +251,34 @@ class Paint:
         """
         self.canvas = (
             decode(action, self.canvas.float() / 255,
-                   num_strokes=self.num_strokes) * 255
+                num_strokes=self.num_strokes) * 255
         ).byte()
 
         canvas_t     = self.canvas.float() / 255.0
         gt_t         = self.gt.float()     / 255.0
         current_wmse = self.weighted_mse(canvas_t, gt_t, self.gt_edge_mask)
 
-        improvement = self.best_wmse - current_wmse
-        extrinsic   = torch.clamp(improvement, min=0.0)
-        self.best_wmse = torch.min(self.best_wmse, current_wmse)
+        # ── REWARD 1: Step-wise improvement (dense signal) ─────────────────────
+        # Compare to LAST step, not best ever. This gives signal every step.
+        step_improvement = self.last_weighted_mse - current_wmse
+        improvement_reward = torch.clamp(step_improvement, min=0.0) * 10.0
 
-        # Alignment reward (first stroke geometry)
+        # ── REWARD 2: Quality maintenance (prevents Q collapse) ────────────────
+        # Reward for current canvas quality, scaled by progress.
+        # Later steps get more reward for same quality → encourages finishing well.
+        quality = 1.0 - (current_wmse / (self.ini_dis + 1e-8))
+        progress = self.stepnum / self.max_step
+        quality_reward = quality * progress * 3.0  # 0 at step 0, up to +3 at end
+
+        # ── REWARD 3: Terminal bonus (ensures final steps matter) ──────────────
+        terminal_reward = 0.0
+        if self.stepnum == self.max_step - 1:  # last step
+            terminal_reward = 20.0 * quality  # up to +20 for perfect finish
+
+        # ── PENALTY: Time cost (prevents lazy behavior) ────────────────────────
+        time_penalty = -0.1  # stronger than your -0.005
+
+        # ── Alignment reward (unchanged) ───────────────────────────────────────
         a0      = action[:, :13]
         x1_abs  = a0[:, 0] + (a0[:, 4] - a0[:, 0]) * a0[:, 2]
         y1_abs  = a0[:, 1] + (a0[:, 5] - a0[:, 1]) * a0[:, 3]
@@ -277,11 +293,15 @@ class Paint:
         align   = torch.abs(torch.cos(torch.atan2(dy, dx) - t_theta))
         align_r = torch.clamp(0.05 * align * e_conf, 0, 0.1)
 
-        extrinsic = extrinsic * 10.0 - 0.005
+        # ── Combine ────────────────────────────────────────────────────────────
+        extrinsic = improvement_reward + quality_reward + terminal_reward + time_penalty
+        extrinsic = torch.clamp(extrinsic, min=0.01)  # floor so Q never hits 0
         total     = extrinsic + align_r
 
-        self.last_weighted_mse = current_wmse
-        self.stepnum          += 1
+        # ── Update state ───────────────────────────────────────────────────────
+        self.last_weighted_mse = current_wmse.detach()
+        self.best_wmse = torch.min(self.best_wmse, current_wmse)  # track but don't use
+        self.stepnum += 1
         done = np.array([self.stepnum == self.max_step] * self.batch_size)
 
         info = {
@@ -289,8 +309,9 @@ class Paint:
             'extrinsic':     extrinsic.mean().item(),
             'intrinsic':     0.0,
             'alignment':     align_r.mean().item(),
-            'step_progress': self.stepnum / self.max_step,
+            'step_progress': progress,
             'total':         total.mean().item(),
+            'quality':       quality.mean().item(),  # log for debugging
         }
         return self.observation().detach(), total.cpu().numpy(), done, info
 

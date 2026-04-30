@@ -143,7 +143,7 @@ def train(agent, env, evaluate, args, writer):
         action  = agent.select_action(observation,
                                       noise_factor=noise_factor,
                                       target_theta=target_theta,
-                                      explore_prob=epsilon)
+                                      training=True)
 
         observation, reward, done, info = env.step(action)
         if info is not None:
