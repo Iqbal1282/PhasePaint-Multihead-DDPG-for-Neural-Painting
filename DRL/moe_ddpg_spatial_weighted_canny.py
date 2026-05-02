@@ -441,27 +441,29 @@ class PaintNoise:
         
     def noise(self, action, phase=0.5, noise_factor=1.0):
         """
-        phase: 0=early, 1=late — controls noise magnitude
+        phase: float or (B,) array — 0=early, 1=late
         """
-        # Phase-dependent base scale: early=more noise, late=less
-        phase_scale = 1.0 - 0.8 * phase  # 1.0 at start, 0.2 at end
-        
-        # Generate structured noise
+        # Ensure phase_scale is (B, 1) so it broadcasts over action columns
+        phase = np.asarray(phase).reshape(-1, 1)          # (B, 1)
+        phase_scale = 1.0 - 0.8 * phase                   # (B, 1)
+
+        # Generate structured noise — shape (B, action_dim)
         noise = np.zeros_like(action)
         for group, scale in self.SCALES.items():
             indices = self.INDICES[group]
             for stroke_idx in range(self.num_strokes):
                 stroke_offset = stroke_idx * 13
                 for idx in indices:
-                    noise[:, stroke_offset + idx] = np.random.normal(
-                        0, scale * phase_scale * noise_factor, 
-                        size=action.shape[0]
+                    col = stroke_offset + idx
+                    # std is (B, 1) broadcast → one sample per env, no size= needed
+                    noise[:, col] = np.random.normal(
+                        0, scale * phase_scale.squeeze(1) * noise_factor
                     )
-        
-        # Add temporal correlation via OU process
-        ou_noise = self.ou.noise() * noise_factor * 0.3  # 30% OU, 70% independent
+
+        # Add temporal correlation via OU process — shape (action_dim,) → broadcasts over B
+        ou_noise = self.ou.noise() * noise_factor * 0.3
         noise += ou_noise
-        
+
         return np.clip(action + noise, 0, 1)
 # ══════════════════════════════════════════════════════════════════════════════
 #  Phase-Conditioned DDPG   (drop-in replacement for DDPG in ddpg.py)
@@ -656,7 +658,7 @@ class MoEDDPG:
         
         if noise_factor > 0 and training:
             # Extract phase from state
-            T_norm = state[:, 6:7, 0, 0].float() / self.max_step if hasattr(state, 'shape') else 0.5
+            T_norm = (state[:, 6:7, 0, 0].float() / self.max_step).cpu().numpy()
             action = self.noise_generator.noise(action, phase=T_norm, noise_factor=noise_factor)
         
         self._set_mode(train=True)
@@ -740,7 +742,7 @@ class MoEDDPG:
             target_q = torch.clamp(
                 self.discount * ((1 - terminal.float()).view(-1, 1)) * next_q
                 + reward.view(-1, 1),
-                -10, 10
+                -100, 100
             )
 
         value_loss = _criterion(cur_q, target_q)
@@ -767,7 +769,7 @@ class MoEDDPG:
             w_gan, w_q = 0.3, 0.7
         
         self.actor_optim.zero_grad()
-        loss = w_gan * (-gan_reward.mean()) + w_q * (-q_val.mean())
+        loss = w_gan * (-gan_reward.mean()) + w_q * (-q_val.mean()*0.1)
         loss.backward()
         self.actor_optim.step()
 
