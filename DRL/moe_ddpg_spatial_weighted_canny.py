@@ -792,7 +792,7 @@ class MoEDDPG:
             w_gan, w_q = 0.6, 0.4
         else:
             # Late: Q dominates (refine accuracy)
-            w_gan, w_q = 0.3, 0.7
+            w_gan, w_q = 0.5, 0.5
         
         self.actor_optim.zero_grad()
         loss = w_gan * (-gan_reward.mean()) + w_q * (-q_val.mean()*0.1)
@@ -843,13 +843,13 @@ class MoEDDPG:
         try:
             print(f'[PhaseDDPG] Loading actor and critic from {path}...')
             self.actor.load_state_dict(
-                torch.load(f'{path}/moe_actor.pkl', map_location=device))
+                torch.load(f'{path}/moe_actor.pkl', map_location=device), strict=False)
             print('[PhaseDDPG] Actor loaded.')
         except FileNotFoundError:
             print(f'[PhaseDDPG] No actor checkpoint at {path}, fresh start.')
         try:
             self.critic.load_state_dict(
-                torch.load(f'{path}/moe_critic.pkl', map_location=device))
+                torch.load(f'{path}/moe_critic.pkl', map_location=device), strict=False)
             print('[PhaseDDPG] Critic loaded.')
         except FileNotFoundError:
             print(f'[PhaseDDPG] No critic checkpoint at {path}, fresh start.')
