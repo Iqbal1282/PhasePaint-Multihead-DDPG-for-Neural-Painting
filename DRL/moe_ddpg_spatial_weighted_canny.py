@@ -188,7 +188,22 @@ class MultiHeadActor(nn.Module):
     Shared ResNet-18 backbone with N parallel output heads.
 
     The backbone is identical to the baseline actor.  The final FC layer
-    is replaced by N separate linear heads (512 → 65 each).
+    is replaced by N separate MLP heads (feat_dim → 256 → num_outputs each).
+
+    Changes vs. original
+    --------------------
+    1. adaptive_avg_pool2d(..., (2, 2)) instead of avg_pool2d(..., 4):
+       After 4 stride-2 layers the feature map is 4×4.  The original kernel-4
+       pool collapsed it to 1×1, discarding all spatial structure.  A 2×2
+       adaptive pool keeps 4 spatial cells, giving feat_dim = 512*4 = 2048
+       and preserving coarse spatial information about where on the canvas
+       features are strongest.
+
+    2. Each head is now a 2-layer MLP with LayerNorm instead of a single
+       Linear layer.  A bare Linear(2048, 65) cannot model any non-linear
+       relationship between the rich backbone features and stroke parameters.
+       The hidden layer + LayerNorm lets each head specialise non-linearly
+       for its phase regime without exploding gradients.
 
     The step-progress T_norm is used to compute Gaussian phase weights
     over the heads.  The final action is the weighted sum:
@@ -198,6 +213,9 @@ class MultiHeadActor(nn.Module):
     All N heads receive gradient at every step, scaled by their phase weight.
     Early heads naturally specialise on coarse strokes; late heads on fine ones.
     """
+
+    # Hidden dim for each head MLP
+    HEAD_HIDDEN = 256
 
     def __init__(self, num_inputs: int, depth: int,
                  num_outputs: int, num_heads: int, sigma: float = 0.35):
@@ -219,12 +237,20 @@ class MultiHeadActor(nn.Module):
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
 
-        feat_dim = 512 * block.expansion   # 512 for BasicBlock (ResNet-18/34)
+        # FIX 1: adaptive_avg_pool2d((2,2)) keeps a 2×2 spatial grid instead
+        # of collapsing to 1×1.  feat_dim = 512 * 2 * 2 = 2048.
+        feat_dim = 512 * block.expansion * 2 * 2   # 2048 for BasicBlock
 
-        # ── N parallel output heads ───────────────────────────────────────────
-        # num_outputs = num_strokes * 13
+        # FIX 2: Replace bare Linear with a 2-layer MLP + LayerNorm per head.
+        # Structure: feat_dim → HEAD_HIDDEN (LN + ReLU) → num_outputs
         self.heads = nn.ModuleList([
-            nn.Linear(feat_dim, num_outputs) for _ in range(num_heads)
+            nn.Sequential(
+                nn.Linear(feat_dim, self.HEAD_HIDDEN),
+                nn.LayerNorm(self.HEAD_HIDDEN),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.HEAD_HIDDEN, num_outputs),
+            )
+            for _ in range(num_heads)
         ])
 
     def _make_layer(self, block, planes, num_blocks, stride):
@@ -254,8 +280,8 @@ class MultiHeadActor(nn.Module):
         feat = self.layer2(feat)
         feat = self.layer3(feat)
         feat = self.layer4(feat)
-        feat = F.avg_pool2d(feat, 4)
-        feat = feat.view(feat.size(0), -1)              # (B, feat_dim)
+        feat = F.adaptive_avg_pool2d(feat, (2, 2))      # (B, 512, 2, 2)
+        feat = feat.view(feat.size(0), -1)              # (B, 2048)
 
         # ── Per-head outputs ──────────────────────────────────────────────────
         head_out = torch.stack(
