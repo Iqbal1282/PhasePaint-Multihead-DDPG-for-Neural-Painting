@@ -540,6 +540,13 @@ class MoEDDPG:
         self.output_path  = output_path
         self.log          = 0
 
+        # ── Running statistics for GAN reward normalisation ───────────────────
+        # Used in _evaluate() to stabilise the GAN shaping signal before it
+        # enters the TD target.  Exponential moving average with α=0.01 so
+        # the stats adapt slowly and do not overreact to individual batches.
+        self._gan_mean = 0.0
+        self._gan_std  = 1.0
+
         # ── Multi-head actor + target ─────────────────────────────────────────
         # action_dim = num_strokes * 13  (configurable)
         self.actor        = MultiHeadActor(9, 18, self.action_dim, num_experts, sigma)
@@ -722,9 +729,30 @@ class MoEDDPG:
         canvas0 = state[:, :3].float()  / 255.0
         canvas1 = decode(action, canvas0, num_strokes=self.num_strokes)
 
-        gan_reward = cal_reward(canvas1, gt) - cal_reward(canvas0, gt)
-        #gan_reward = torch.tanh(cal_reward(canvas1, gt) - cal_reward(canvas0, gt))
+        # ── Raw GAN delta (high variance, unbounded WGAN scores) ──────────────
+        gan_raw = cal_reward(canvas1, gt) - cal_reward(canvas0, gt)  # (B, 1)
 
+        # ── Normalise GAN signal with exponential moving average stats ────────
+        # This stabilises the critic TD target without destroying the signal
+        # direction.  We update stats only during forward passes (not target
+        # network passes) to avoid double-counting.
+        if not target:
+            with torch.no_grad():
+                batch_mean = gan_raw.mean().item()
+                batch_std  = gan_raw.std().item() + 1e-6
+                # EMA update: α=0.01 → slow adaptation, resistant to outliers
+                self._gan_mean = 0.99 * self._gan_mean + 0.01 * batch_mean
+                self._gan_std  = 0.99 * self._gan_std  + 0.01 * batch_std
+
+        # Normalise then squash to [-0.3, 0.3]:
+        #   - Normalisation removes scale drift as the discriminator trains
+        #   - tanh hard-clips outlier batches that would otherwise spike the TD target
+        #   - 0.3 cap keeps GAN shaping as a soft bonus, never dominating env reward
+        gan_shaped = torch.tanh(
+            (gan_raw - self._gan_mean) / (self._gan_std + 1e-6)
+        ) * 0.3                                         # (B, 1), bounded [-0.3, 0.3]
+
+        # ── Critic forward ────────────────────────────────────────────────────
         n      = state.shape[0]
         coord_ = _coord.expand(n, 2, 128, 128)
         merged = torch.cat([
@@ -733,16 +761,23 @@ class MoEDDPG:
             coord_,
         ], dim=1)
 
-        # ── FIX: Pass T_norm explicitly to TemporalCritic ─────────────────────
-        T_norm = T / self.max_step  # (B, 1) normalised progress
+        T_norm     = T / self.max_step                  # (B, 1) normalised progress
         critic_net = self.critic_target if target else self.critic
-        Q = critic_net(merged, T_norm)
+        Q          = critic_net(merged, T_norm)
+
+        # GAN shaping is added to Q here so it enters the Bellman backup.
+        # The actor will only ever optimise Q (which already encodes the GAN
+        # preference), so it never sees raw GAN scores directly.
+        Q_shaped = Q + gan_shaped
 
         if not target and self.log % 20 == 0 and self.writer:
-            self.writer.add_scalar('train_moe/expect_reward', Q.mean(),         self.log)
-            self.writer.add_scalar('train_moe/gan_reward',    gan_reward.mean(), self.log)
+            self.writer.add_scalar('train_moe/expect_reward',  Q.mean(),          self.log)
+            self.writer.add_scalar('train_moe/gan_raw',        gan_raw.mean(),    self.log)
+            self.writer.add_scalar('train_moe/gan_shaped',     gan_shaped.mean(), self.log)
+            self.writer.add_scalar('train_moe/gan_ema_mean',   self._gan_mean,    self.log)
+            self.writer.add_scalar('train_moe/gan_ema_std',    self._gan_std,     self.log)
 
-        return Q + gan_reward, Q,  gan_reward
+        return Q_shaped, Q, gan_shaped
 
     # ── Policy update ─────────────────────────────────────────────────────────
 
@@ -758,13 +793,19 @@ class MoEDDPG:
         # ── GAN (discriminator head update, encoder frozen) ───────────────
         self._update_gan(next_state)
 
-        # ── Critic: TD error backprop through encoder ─────────────────────
-        # Use _evaluate to handle the 12-channel concatenation internally
-        cur_q  = self._evaluate(state, action)[1]   # Q only, no GAN
+        # ── Critic: TD error ──────────────────────────────────────────────────
+        # cur_q uses the live critic (not target) and includes GAN shaping in
+        # the Q_shaped return value, but we train the critic on pure Q only
+        # so the value function stays grounded in env rewards.
+        cur_q  = self._evaluate(state, action)[1]       # pure Q, no GAN shaping
 
         with torch.no_grad():
             next_action = self.play(next_state, target=True)
-            next_q      = self._evaluate(next_state, next_action, target=True)[1]
+            # next_q from target network — Q_shaped so Bellman backup propagates
+            # the GAN shaping signal across time steps.  This is the key:
+            # a stroke that looks good on GAN now but hurts future steps will
+            # receive low next_q values that discount its apparent benefit.
+            next_q = self._evaluate(next_state, next_action, target=True)[0]  # Q_shaped
             target_q = torch.clamp(
                 self.discount * ((1 - terminal.float()).view(-1, 1)) * next_q
                 + reward.view(-1, 1),
@@ -776,27 +817,19 @@ class MoEDDPG:
         value_loss.backward()
         self.critic_optim.step()
 
-        # Actor update
+        # ── Actor: optimise Q only — never raw GAN directly ───────────────────
+        # _evaluate returns (Q_shaped, Q, gan_shaped).  We use Q_shaped here so
+        # the actor gradient flows through both the env-reward critic signal AND
+        # the GAN shaping — but the GAN component is already normalised and
+        # bounded, and it is discounted by the Bellman backup, so greedy
+        # per-step GAN maximisation is no longer rewarded.
         norm_img, T_norm = self._norm_obs(state)
-        action_pred = self.actor(norm_img, T_norm)
-        _, q_val, gan_reward = self._evaluate(state.detach(), action_pred)
-        
-        # Phase-based dynamic weighting
-        progress = step / max(train_times, 1)
-        
-        if progress < 0.3:
-            # Early: GAN dominates (learn to paint realistically)
-            w_gan, w_q = 0.9, 0.1
-        elif progress < 0.7:
-            # Mid: balanced
-            w_gan, w_q = 0.6, 0.4
-        else:
-            # Late: Q dominates (refine accuracy)
-            w_gan, w_q = 0.5, 0.5
-        
+        action_pred      = self.actor(norm_img, T_norm)
+        q_shaped, q_val, gan_shaped = self._evaluate(state.detach(), action_pred)
+
         self.actor_optim.zero_grad()
-        loss = w_gan * (-gan_reward.mean()) + w_q * (-q_val.mean()*0.1)
-        loss.backward()
+        actor_loss = -q_shaped.mean()                   # single clean signal
+        actor_loss.backward()
         self.actor_optim.step()
 
         # ── Target Sync & Logging ─────────────────────────────────────────
@@ -804,8 +837,11 @@ class MoEDDPG:
         soft_update(self.critic_target, self.critic, self.tau)
 
         if self.log % 20 == 0 and self.writer:
-            self.writer.add_scalar('train_moe/policy_loss', loss.item(), self.log)
+            self.writer.add_scalar('train_moe/policy_loss', actor_loss.item(),  self.log)
             self.writer.add_scalar('train_moe/value_loss',  value_loss.item(),  self.log)
+            self.writer.add_scalar('train_moe/q_shaped',    q_shaped.mean().item(), self.log)
+            self.writer.add_scalar('train_moe/q_val',       q_val.mean().item(),    self.log)
+            self.writer.add_scalar('train_moe/gan_shaped',  gan_shaped.mean().item(), self.log)
             for k, head in enumerate(self.actor.heads):
                 grad_norm = sum(
                     p.grad.norm().item() ** 2
@@ -814,8 +850,6 @@ class MoEDDPG:
                 self.writer.add_scalar(f'train_moe/head{k}_grad_norm', grad_norm, self.log)
 
         return q_val.mean(), value_loss
-
-    # ── Mode helpers ──────────────────────────────────────────────────────────
 
     def _set_mode(self, train=True):
         fn = 'train' if train else 'eval'
