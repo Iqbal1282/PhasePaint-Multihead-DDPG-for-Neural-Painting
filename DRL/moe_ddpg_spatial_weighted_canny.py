@@ -748,10 +748,9 @@ class MoEDDPG:
         #   - Normalisation removes scale drift as the discriminator trains
         #   - tanh hard-clips outlier batches that would otherwise spike the TD target
         #   - 0.3 cap keeps GAN shaping as a soft bonus, never dominating env reward
-        gan_shaped = torch.tanh(
-            (gan_raw - self._gan_mean) / (self._gan_std + 1e-6)
-        ) * 0.3                                         # (B, 1), bounded [-0.3, 0.3]
-
+        # this normalization is taking the gan value to negattive. i dont want it what should i do?
+        gan_shaped = (gan_raw - self._gan_mean) / (self._gan_std + 1e-6)       # (B, 1), bounded [-0.3, 0.3]
+        
         # ── Critic forward ────────────────────────────────────────────────────
         n      = state.shape[0]
         coord_ = _coord.expand(n, 2, 128, 128)
@@ -808,7 +807,7 @@ class MoEDDPG:
             next_q = self._evaluate(next_state, next_action, target=True)[0]  # Q_shaped
             target_q = torch.clamp(
                 self.discount * ((1 - terminal.float()).view(-1, 1)) * next_q
-                + reward.view(-1, 1),
+                + reward.view(-1, 1)*0.1,
                 -100, 100
             )
 
